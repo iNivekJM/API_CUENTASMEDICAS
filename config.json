@@ -1,0 +1,48 @@
+{
+  "database": {
+    "mongo_uri": "mongodb://localhost:27017/",
+    "mongo_db_name": "FacturacionCM",
+    "oracle_db": {
+      "user": "",
+      "password": "",
+      "dsn": ""
+    }
+  },
+  "directories": {
+    "upload_folder": "FilesPending",
+    "processing_folder": "ProcessingFiles",
+    "processed_files_folder": "ProcessedFiles",
+    "bad_zip_folder": "BadZips",
+    "save_zip_folder": "SaveZips"
+  },
+  "api": {
+    "port": 8000
+  },
+  "worker": {
+    "poll_interval_seconds": 1,
+    "max_concurrent_tasks": 2,
+    "max_retries": 3,
+    "retry_interval_minutes": 1,
+    "notification_check_interval_seconds": 300
+  },
+  "sftp": {
+    "host": "",
+    "username": "",
+    "priv_key": ".key",
+    "password": "",
+    "port": 22,
+    "remote_base_path": "/img2/CuentasMedicas/Facturas/123123/"
+  },
+  "url": {
+    "error": ""
+  },
+  "notification_retries": {
+    "max_retries": 3,
+    "retry_delay_seconds": 10
+  },
+  "pdf_compression": {
+    "ghostscript_path": "C:\\Program Files\\gs\\gs10.03.1\\bin\\gswin64c.exe",
+    "power": 3,
+    "min_size_mb": 1
+  }
+}
