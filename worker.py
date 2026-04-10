@@ -13,7 +13,7 @@ import subprocess
 import oracledb
 
 # --- Cargar Configuración desde config.json ---
-def load_config(config_path="config.json"):
+def load_config(config_path="C:\\API_CUENTASMEDICAS\\config.json"):
     """Carga las configuraciones desde un archivo JSON."""
     try:
         with open(config_path, 'r') as f:
@@ -63,6 +63,7 @@ MAX_CONCURRENT_TASKS = CONFIG["worker"]["max_concurrent_tasks"]
 MAX_RETRIES = CONFIG["worker"]["max_retries"]
 RETRY_INTERVAL_MINUTES = CONFIG["worker"]["retry_interval_minutes"]
 NOTIFICATION_CHECK_INTERVAL_SECONDS = CONFIG["worker"].get("notification_check_interval_seconds", 300)
+CLEANUP_INTERVAL = CONFIG["worker"].get("cleanup_interval_seconds", 600)
 
 # --- Configuración SFTP ---
 SFTP_CONFIG = CONFIG["sftp"]
@@ -123,14 +124,10 @@ def sftp_mkdir_p(sftp_client, remote_path, thread_name="SFTP"):
 # --- Funciones de Compresión de PDF ---
 def compress_pdf(input_path, output_path, power):
     """
-    Comprime un archivo PDF utilizando Ghostscript.
-    Args:
-        input_path (str): Ruta al archivo PDF de entrada.
-        output_path (str): Ruta al archivo PDF de salida comprimido.
-        power (int): Nivel de compresión (0-4).
-    Returns:
-        tuple: (True, mensaje de éxito) o (False, mensaje de error).
+    Comprime un archivo PDF utilizando Ghostscript SIN abrir ventana CMD.
     """
+    import sys
+    
     quality = {
         0: '/default',
         1: '/prepress',
@@ -152,18 +149,37 @@ def compress_pdf(input_path, output_path, power):
     ]
 
     try:
-        result = subprocess.run(gs_command, check=True, capture_output=True, text=True, encoding='utf-8')
-        return True, f"Comprimido: {input_path} -> {output_path}. Salida: {result.stdout}"
+        # 👇 Configuración para ejecutar sin ventana CMD en Windows
+        kwargs = {}
+        if sys.platform == "win32":
+            # Método moderno (Python 3.7+)
+            if hasattr(subprocess, 'CREATE_NO_WINDOW'):
+                kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+            else:
+                # Método legacy
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                kwargs['startupinfo'] = startupinfo
+
+        result = subprocess.run(
+            gs_command, 
+            check=True, 
+            capture_output=True, 
+            text=True, 
+            encoding='utf-8',
+            **kwargs
+        )
+        return True, f"Comprimido: {input_path} -> {output_path}."
+        
     except subprocess.CalledProcessError as e:
         if not os.path.exists(input_path):
-            return False, f"Error: El archivo '{input_path}' no existe al intentar comprimir."
-        # print(f"Error al comprimir '{input_path}': {e}")
-        # print(f"Salida de Ghostscript (stderr):\n{e.stderr}")
+            return False, f"Error: El archivo '{input_path}' no existe."
         return False, f"Error al comprimir {input_path}: {e.stderr}"
     except FileNotFoundError:
-        return False, f"Error: No se encontró el ejecutable de Ghostscript en la ruta especificada: '{GHOSTSCRIPT_PATH}'. Verifique la ruta."
+        return False, f"Error: No se encontró Ghostscript en: '{GHOSTSCRIPT_PATH}'"
     except Exception as e:
-        return False, f"Error inesperado en compress_pdf para '{input_path}': {e}"
+        return False, f"Error inesperado en compress_pdf: {e}"
 
 
 def process_pdf(input_path, subdir_for_temp_files, power, min_size_mb):
@@ -399,6 +415,80 @@ def check_pending_notifications():
     else:
         print(f"[{thread_name}] No se encontraron facturas con notificaciones pendientes para Oracle.")
 
+# --- Funciones de Mantenimiento y Limpieza ---
+def cleanup_stuck_processing_tasks():
+    """
+    Problema #1: Recupera tareas que quedaron en 'processing' perpetuo.
+    Si el archivo aún existe en UPLOAD_FOLDER, se regresa a 'pending'.
+    """
+    thread_name = threading.current_thread().name
+    # Definimos un umbral de tiempo (ej. tareas que llevan más de 30 mins en 'processing')
+    stuck_threshold = datetime.now() - timedelta(minutes=30)
+    
+    query = {
+        "status": "processing",
+        "processing_start_time": {"$lt": stuck_threshold}
+    }
+    
+    stuck_tasks = invoices_collection.find(query)
+    count = 0
+    
+    for doc in stuck_tasks:
+        invoice_id = doc["_id"]
+        file_path = doc.get("file_path", "")
+        
+        if os.path.exists(file_path):
+            invoices_collection.update_one(
+                {"_id": invoice_id},
+                {"$set": {"status": "pending", "error_message": "Recuperado de estado processing trabado."}}
+            )
+            count += 1
+        else:
+            # Si el archivo ya no está, es que se procesó pero no se marcó. 
+            # Lo marcamos como fallido para revisión manual.
+            invoices_collection.update_one(
+                {"_id": invoice_id},
+                {"$set": {"status": "error", "error_message": "Archivo no encontrado tras interrupción en processing."}}
+            )
+            
+    if count > 0:
+        print(f"[{thread_name}] Limpieza: {count} tareas 'processing' devueltas a 'pending'.")
+
+def validate_and_reset_failed_tasks():
+    """
+    Problema #2: Valida tareas 'failed'.
+    Si el archivo ZIP existe en UPLOAD_FOLDER, reinicia a 'pending'.
+    Si NO existe, marca como 'error' definitivo.
+    """
+    thread_name = threading.current_thread().name
+    # Solo intentamos recuperar fallos que no sean por nombre inválido o zip corrupto ya detectado
+    query = {
+        "status": "failed"
+    }
+    
+    failed_tasks = invoices_collection.find(query)
+    reset_count = 0
+    error_count = 0
+    
+    for doc in failed_tasks:
+        invoice_id = doc["_id"]
+        file_path = doc.get("file_path", "")
+        
+        if file_path and os.path.exists(file_path):
+            invoices_collection.update_one(
+                {"_id": invoice_id},
+                {"$set": {"status": "pending", "retries": 0}} # Resetear retries para dar nueva oportunidad
+            )
+            reset_count += 1
+        else:
+            invoices_collection.update_one(
+                {"_id": invoice_id},
+                {"$set": {"status": "error", "error_message": "Archivo ZIP no encontrado en la ruta de carga."}}
+            )
+            error_count += 1
+
+    if reset_count > 0 or error_count > 0:
+        print(f"[{thread_name}] Mantenimiento: {reset_count} reestablecidas, {error_count} marcadas como error final.")
 
 # --- Función de Tarea del Worker ---
 def process_single_invoice(invoice_doc):
@@ -539,7 +629,12 @@ def process_single_invoice(invoice_doc):
             # Subir ZIP defectuoso a la ruta base SFTP.
             # Asegúrate de que el path para bad_zip_folder se construye correctamente en el SFTP.
             # Aquí lo estoy subiendo a la misma remote_base_path pero con el nombre del zip directamente.
-            sftp_bad_zip_target_path = os.path.join(SFTP_CONFIG["remote_base_path"], zip_filename).replace("\\", "/")
+            # sftp_bad_zip_target_path = os.path.join(SFTP_CONFIG["remote_base_path"], zip_filename).replace("\\", "/")
+            sftp_bad_zip_target_path = os.path.join(SFTP_CONFIG["remote_base_path"], nit_folder, factura_folder).replace("\\", "/")
+            # sftp_remote_path = os.path.join(SFTP_CONFIG["remote_base_path"], nit_folder, factura_folder).replace("\\", "/")
+
+            # sftp_bad_zip_target_path = os.path.join(SFTP_CONFIG["remote_base_path"], zip_filename).replace("\\", "/")
+            destination_value_error_path = os.path.join(UPLOAD_FOLDER, zip_filename)
 
             if transport is None or not transport.is_active():
                 transport = paramiko.Transport((SFTP_CONFIG["host"], SFTP_CONFIG.get("port", 22)))
@@ -550,9 +645,11 @@ def process_single_invoice(invoice_doc):
                 transport.connect(username=SFTP_CONFIG["username"], pkey=private_key)
                 sftp = paramiko.SFTPClient.from_transport(transport)
             
-            sftp_mkdir_p(sftp, os.path.dirname(sftp_bad_zip_target_path), thread_name)
-
-            sftp.put(processing_zip_path, sftp_bad_zip_target_path)
+            sftp_mkdir_p(sftp, sftp_bad_zip_target_path, thread_name)
+            # sftp_mkdir_p(sftp, os.path.dirname(sftp_bad_zip_target_path), thread_name)
+            
+            sftp_bad_zip_target_path = f"{sftp_bad_zip_target_path}/{zip_filename}"
+            sftp.put(destination_value_error_path, sftp_bad_zip_target_path)
             print(f"[{thread_name}] Archivo ZIP defectuoso subido a SFTP: {sftp_bad_zip_target_path}")
 
             invoices_collection.update_one(
@@ -575,7 +672,7 @@ def process_single_invoice(invoice_doc):
             return
 
         except Exception as sftp_e:
-            error_msg_sftp_bad_zip_upload = f"Error al subir el ZIP defectuoso '{zip_filename}' a SFTP ({sftp_bad_zip_target_path}): {sftp_e}"
+            error_msg_sftp_bad_zip_upload = f"Error al subir el ZIP defectuoso '{zip_filename}' a SFTP ({destination_value_error_path}) -> ({sftp_bad_zip_target_path}): {sftp_e}"
             # print(f"[{thread_name}] {error_msg_sftp_bad_zip_upload}")
 
             invoices_collection.update_one(
@@ -675,6 +772,7 @@ def worker_main():
 
     active_threads = []
     last_notification_check_time = time.time()
+    last_cleanup_time = time.time() # Tracker para la nueva limpieza
 
     while True:
         active_threads = [t for t in active_threads if t.is_alive()]
@@ -684,6 +782,14 @@ def worker_main():
             check_pending_notifications()
             last_notification_check_time = time.time()
             # print("--- Verificación de notificaciones pendientes (Oracle) finalizada ---")
+
+        # 2. NUEVA LÓGICA: Ejecución de Limpieza de Estados (Problema #1 y #2)
+        if time.time() - last_cleanup_time >= CLEANUP_INTERVAL:
+            print("--- Iniciando mantenimiento preventivo de estados ---")
+            cleanup_stuck_processing_tasks()
+            validate_and_reset_failed_tasks()
+            last_cleanup_time = time.time()
+            print("--- Mantenimiento preventivo finalizado ---")
 
         if len(active_threads) < MAX_CONCURRENT_TASKS:
             retry_threshold_time = datetime.now() - timedelta(minutes=RETRY_INTERVAL_MINUTES)
