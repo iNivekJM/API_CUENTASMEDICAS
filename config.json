@@ -23,7 +23,8 @@
     "max_concurrent_tasks": 2,
     "max_retries": 3,
     "retry_interval_minutes": 1,
-    "notification_check_interval_seconds": 300
+    "notification_check_interval_seconds": 300,
+    "cleanup_interval_seconds": 600
   },
   "sftp": {
     "host": "",
